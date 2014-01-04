@@ -1,0 +1,162 @@
+//**************************************************************************************************
+//** Function:    Get Restricted Models (getRestrictedModels)                                                 
+//** Type:        Commerce Library Function                                                                   
+//**                                                                                                          
+//** Description: Returns a list of families, lines, models, punchins that should be restricted based 
+//**              on BAN/BP, opportunity record type, sales channel, financial company                               
+//**                                                                                                          
+//** History:     Date     Author       Comment                                                               
+//**              01/01/11 Big Machines Initial Implementation by Big Machines       
+//**              08/19/13 SKharche     BIGMACH-2491 - Update logic to handle incorrect ids when 
+//**                                    restricting products on home page                         
+//**              08/28/13 SKharche     BIGMACH-2495 - Provide ability restrict access to family, line, model or punchin 
+//**              11/11/13 SKharche     BIGMACH-2896 - SFDC merge - product access
+//**************************************************************************************************
+
+/*
+ALGORITHM
+1. Get models that are not salable (meaning salabilityRestricted=1)
+2. Get models that are salable for this BPId
+3. Get models that are salable for this BAN
+4. Models found in step 2 & 3 should be removed from the not salable list as these are salable
+5. If CRM system is CTL then we do additional logic
+6. Get the Levels, Names and Defaults from the RestrictProductLevel table. RestrictProductLevel denotes 
+   which levels within the product hierarchy are restricted
+7. ProductLevelAccess controls which types of quotes will get access to that restricted level. We now 
+   get Action for one of the QualityValue and for a particular level and name ordered by sequence. 
+   Higher sequence trumps lower sequence and Action trumps default action
+8. If action is Revoke then the element is restricted 
+9. Return all the restricted elements as a comma seperated list which gets stored in restrictedModels_quote
+   and is set in a cookie so that it can be accessed by homepage
+   - Homepage then reads this cookie
+   - Iterates over this list and hide all the elements that are restricted
+   - It also makes sure to hide all the restricted elements from appearing in product search
+   - If all the models of a line are hidden then JS hides that line
+   - If all the lines of a family are hidden then JS hides that family
+*/
+
+retStr             = "";
+incorrectIDsModel  = "";           
+restrictedElements = "";
+
+restrictedModelsArray   = string[];
+restrictedElementsArray = string[]; 
+levels                  = string[];
+names                   = string[];
+defaults                = string[];
+incorrectModelIDs       = string[];
+systemUserGroups	= split(_system_user_groups,"+");
+salableModelsDict = dict("string");
+
+// Get the models that have salability restricted = 1
+retTbl = bmql("SELECT DISTINCT ModelVariableName FROM SvcPkgMaster WHERE SalabilityRestricted=1");
+for row in retTbl {
+	modelVarName = get(row, "ModelVariableName");
+	if(modelVarName <> "") {
+		append(restrictedModelsArray, modelVarName);
+	}
+}
+
+// Get the list of models who's BPId matches that on the quote. These will be added to salable models dict.
+bpid = string(bPID_quote);
+retTbl = bmql("SELECT DISTINCT ModelVariableName FROM SvcPkgSalableByBP WHERE ModelVariableName IN $restrictedModelsArray AND BPId = $bpid");
+for row in retTbl {
+	modelVarName = get(row, "ModelVariableName");
+	if(modelVarName <> "") {
+        put(salableModelsDict, modelVarName, modelVarName);
+	}
+}
+
+// Get the list of models who's BAN matches that on the quote. These will be added to salable models dict.
+retTbl = bmql("SELECT DISTINCT ModelVariableName FROM SvcPkgSalableByBAN WHERE ModelVariableName IN $restrictedModelsArray AND BAN = $bANNumber_quote");
+for row in retTbl {
+	modelVarName = get(row, "ModelVariableName");
+	if(modelVarName <> "") {
+		put(salableModelsDict, modelVarName, modelVarName);
+	}
+}
+
+// Any model that is not in the YES list should be restricted (hidden)
+for modelVarName in restrictedModelsArray {
+    // Create a list of all the model variable names that have space in them
+    // Javascript is used to hide all the ids and it breaks if it sees space in the ids
+    if(find(modelVarName, " ") <> -1) {
+        append(incorrectModelIDs, modelVarName);
+    }
+    // Restricted models should have prefix "model-" as this is the prefix for actual id on home page
+    // If we don't add the prefix "model-" then javascript won't find match on the id and hence it won't hide the model
+    elif(NOT containskey(salableModelsDict, modelVarName)) {
+        append(restrictedElementsArray, "model-" + modelVarName);
+    }
+}
+
+// BIGMACH-2495 - Provide ability restrict access to family, line, model or punchin
+// Get the Levels, Names and Defaults from the RestrictProductLevel table. RestrictProductLevel denotes 
+// which levels within the product hierarchy are restricted
+// The below logic should trigger only if the quote is created from CTL CRM becasue that's the only 
+// scenario when we will lock down elements based on opportunity record type, sales channel or financial company
+
+if(crmSystemName_quote == "CTL") {
+    retTbl = bmql("SELECT Level, Name, Default FROM ProductLevel"); 
+    for row in retTbl {
+        level = get(row, "Level");
+        name  = get(row, "Name");
+        
+        append(levels, level);
+        append(names, name);
+        append(defaults, get(row, "Default"));
+    }
+
+    indexes = range(sizeofarray(levels));
+    for index in indexes {
+        level  = levels[index];
+        name   = names[index];
+        action = defaults[index];
+        
+        // BIGMACH-2896 - SFDC merge - product access
+        // QualityValue column can have Savvis for salesChannel as well as opptyRecordType giving incorrect
+        // results. Updating the query to make sure we check the correct combinations of Quality and QualityValue.
+        // ProductLevelAccess controls which types of quotes will get access to that restricted level
+        // We now get Action for one of the QualityValue and for a particular level and name ordered by
+        // sequence. Higher sequence trumps lower sequence.
+        retTbl = bmql("SELECT Action FROM ProductLevelAccess WHERE ("
+                     + "(Quality = 'OptyRecordType' AND QualityValue = $opportunityRecordType_quote) OR " 
+                     + "(Quality = 'SalesChannel' AND QualityValue = $salesChannel_quote) OR "
+                     + "(Quality = 'Company' AND QualityValue = $savvisCompany_quote)) AND "
+                     + "Level = $level AND Name = $name ORDER BY Sequence DESC");
+                     
+        for row in retTbl {
+            action = get(row, "Action");
+            break;
+        }
+        
+        // Override action trumps the default action
+        if(NOT isnull(action) AND action == "Revoke") {
+            // If action is Revoke then the element is restricted    
+            append(restrictedElementsArray, level + "-" + name);
+        }
+    }
+}
+
+// This is used to restrict all types of elements on the home page if needed
+// This provides greater flexibility in revoking or granting access to specific users based on opportunity
+// record type, sales channel, financial company, BPId, BAN
+// Eg: SVVS products sold from CTL CRM only when opportunityRecordType_quote is CPQ Savvis
+// If there are any elements (model, line, family, punchin) to restrict then those are added to this list
+if(NOT isempty(restrictedElementsArray)) {
+    restrictedElements = join(restrictedElementsArray, ",");
+}
+retStr = retStr + "1~restrictedModels_quote~" + restrictedElements + "|";
+
+// BIGMACH-2491 - Populate validation error message if validations exists
+preValidationError = "";
+if(NOT isempty(incorrectModelIDs)) {
+    preValidationError = "Please contact Support to correct the following model variable names in SvcPkgMaster data table - ";
+    
+    for modelVarName in incorrectModelIDs {
+        preValidationError = util.concatStringIfFits(preValidationError, modelVarName + ",");
+    }
+}
+retStr = retStr + "1~preValidationError_quote~" + preValidationError + "|";
+
+return retStr;
