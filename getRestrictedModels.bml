@@ -3,7 +3,7 @@
 //** Type:        Commerce Library Function                                                                   
 //**                                                                                                          
 //** Description: Returns a list of families, lines, models, punchins that should be restricted based 
-//**              on BAN/BP, opportunity record type, sales channel, financial company                               
+//**              on BAN/BP, opportunity record type, sales channel, financial company, UserGroup                               
 //**                                                                                                          
 //** History:     Date     Author       Comment                                                               
 //**              01/01/11 Big Machines Initial Implementation by Big Machines       
@@ -11,6 +11,10 @@
 //**                                    restricting products on home page                         
 //**              08/28/13 SKharche     BIGMACH-2495 - Provide ability restrict access to family, line, model or punchin 
 //**              11/11/13 SKharche     BIGMACH-2896 - SFDC merge - product access
+//**              01/08/14 WHaverhals   US2399: Evaluate Quality: UserGroup in the ProductLevelAccess data 
+//**                                            table and introduce a Status Column in the BMQL that queries
+//**                                            ProductLevel and ProductLevelAccess tables.   Additional System
+//**                                            Attribute _system_user_groups needs to be added.
 //**************************************************************************************************
 
 /*
@@ -20,7 +24,7 @@ ALGORITHM
 3. Get models that are salable for this BAN
 4. Models found in step 2 & 3 should be removed from the not salable list as these are salable
 5. If CRM system is CTL then we do additional logic
-6. Get the Levels, Names and Defaults from the RestrictProductLevel table. RestrictProductLevel denotes 
+6. Get the Levels, Names and Defaults from the ProductLevel table. ProductLevel denotes 
    which levels within the product hierarchy are restricted
 7. ProductLevelAccess controls which types of quotes will get access to that restricted level. We now 
    get Action for one of the QualityValue and for a particular level and name ordered by sequence. 
@@ -45,7 +49,12 @@ levels                  = string[];
 names                   = string[];
 defaults                = string[];
 incorrectModelIDs       = string[];
+
+//US2399: WimHaverhals/+++
 systemUserGroups	= split(_system_user_groups,"+");
+statusInactive		= "Inactive";
+//US2399: WimHaverhals/---
+
 salableModelsDict = dict("string");
 
 // Get the models that have salability restricted = 1
@@ -97,8 +106,13 @@ for modelVarName in restrictedModelsArray {
 // scenario when we will lock down elements based on opportunity record type, sales channel or financial company
 
 if(crmSystemName_quote == "CTL") {
-    retTbl = bmql("SELECT Level, Name, Default FROM ProductLevel"); 
+    //US2399: Add Status to query to ProductLevel Table
+    //retTbl = bmql("SELECT Level, Name, Default FROM ProductLevel"); 
+    retTbl = bmql("SELECT Level, Name, Default, Status FROM ProductLevel WHERE "
+                 + " Status IS NULL OR Status <> $statusInactive");
+    
     for row in retTbl {
+       
         level = get(row, "Level");
         name  = get(row, "Name");
         
@@ -113,6 +127,7 @@ if(crmSystemName_quote == "CTL") {
         name   = names[index];
         action = defaults[index];
         
+        // US2399: Add Status to Query
         // BIGMACH-2896 - SFDC merge - product access
         // QualityValue column can have Savvis for salesChannel as well as opptyRecordType giving incorrect
         // results. Updating the query to make sure we check the correct combinations of Quality and QualityValue.
@@ -122,9 +137,11 @@ if(crmSystemName_quote == "CTL") {
         retTbl = bmql("SELECT Action FROM ProductLevelAccess WHERE ("
                      + "(Quality = 'OptyRecordType' AND QualityValue = $opportunityRecordType_quote) OR " 
                      + "(Quality = 'SalesChannel' AND QualityValue = $salesChannel_quote) OR "
+                     + "(Quality = 'UserGroup' AND QualityValue IN $systemUserGroups) OR "
                      + "(Quality = 'Company' AND QualityValue = $savvisCompany_quote)) AND "
-                     + "Level = $level AND Name = $name ORDER BY Sequence DESC");
-                     
+                     + "Level = $level AND Name = $name AND "
+                     + "(Status IS NULL OR Status <> $statusInactive) ORDER BY Sequence DESC");                
+        
         for row in retTbl {
             action = get(row, "Action");
             break;
